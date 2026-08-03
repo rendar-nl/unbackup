@@ -1,0 +1,564 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+plugin="unbackup"
+hostname="$(hostname -s | tr '[:upper:]' '[:lower:]')"
+config_file="/boot/config/plugins/${plugin}/settings.json"
+state_dir="/boot/config/plugins/${plugin}/state"
+log_file="${state_dir}/last.log"
+status_file="${state_dir}/status.env"
+lock_file="/var/run/${plugin}.lock"
+template_dir="/boot/config/plugins/dockerMan/templates-user"
+
+APPDATA_ROOT="/mnt/cache/appdata"
+APPDATA_MODE="templates"
+DESTINATION="/mnt/user/backup/unbackup"
+INCLUDE_APPDATA="yes"
+INCLUDE_BOOT="yes"
+BOOT_SOURCE="/boot/config"
+INCLUDE_DOCKER_SOURCE="no"
+DOCKER_SOURCE=""
+KEEP_LAST="4"
+ZSTD_LEVEL="6"
+EXCLUDE_FILE="/boot/config/plugins/unbackup/excludes.txt"
+
+timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+archive=""
+archive_partial=""
+work_dir=""
+snapshot_base=""
+snapshot_path=""
+snapshot_mountpoint=""
+docker_capture_parent=""
+docker_capture_root=""
+docker_snapshot_path=""
+docker_snapshot_base=""
+docker_snapshot_name=""
+docker_snapshot_type=""
+docker_source_rel=""
+docker_archive_path=""
+docker_transform=""
+docker_capture_method=""
+failure_line=""
+record_status="no"
+tar_excludes=()
+appdata_paths=()
+
+load_config() {
+  [[ -f "${config_file}" ]] || return 0
+  eval "$(CONFIG_FILE="${config_file}" php <<'PHP'
+<?php
+$file = getenv('CONFIG_FILE');
+$defaults = [
+  'APPDATA_ROOT' => '/mnt/cache/appdata',
+  'APPDATA_MODE' => 'templates',
+  'DESTINATION' => '/mnt/user/backup/unbackup',
+  'INCLUDE_APPDATA' => 'yes',
+  'INCLUDE_BOOT' => 'yes',
+  'BOOT_SOURCE' => '/boot/config',
+  'INCLUDE_DOCKER_SOURCE' => 'no',
+  'DOCKER_SOURCE' => '',
+  'KEEP_LAST' => '4',
+  'ZSTD_LEVEL' => '6',
+  'EXCLUDE_FILE' => '/boot/config/plugins/unbackup/excludes.txt',
+  'BACKUP_FREQUENCY' => 'disabled',
+  'DAY_OF_WEEK' => '1',
+  'DAY_OF_MONTH' => '1',
+  'HOUR' => '0',
+  'MINUTE' => '0',
+  'CUSTOM_CRON' => '',
+];
+$cfg = json_decode(@file_get_contents($file), true);
+if (!is_array($cfg)) $cfg = [];
+foreach ($defaults as $key => $default) {
+  $value = array_key_exists($key, $cfg) ? (string)$cfg[$key] : $default;
+  echo $key . '=' . escapeshellarg($value) . PHP_EOL;
+}
+PHP
+)"
+  if [[ "${DESTINATION}" == "/mnt/user/backup/docker-boot" ]]; then
+    DESTINATION="/mnt/user/backup/unbackup"
+  fi
+  if [[ "${EXCLUDE_FILE}" == "/boot/config/plugins/docker.boot.backup/excludes.txt" ]]; then
+    EXCLUDE_FILE="/boot/config/plugins/unbackup/excludes.txt"
+  fi
+}
+
+cron_expr() {
+  local minute hour dow dom
+  minute="${MINUTE:-0}"
+  hour="${HOUR:-0}"
+  dow="${DAY_OF_WEEK:-1}"
+  dom="${DAY_OF_MONTH:-1}"
+  case "${BACKUP_FREQUENCY:-disabled}" in
+    daily) printf '%s %s * * *\n' "${minute}" "${hour}" ;;
+    weekly) printf '%s %s * * %s\n' "${minute}" "${hour}" "${dow}" ;;
+    monthly) printf '%s %s %s * *\n' "${minute}" "${hour}" "${dom}" ;;
+    custom) printf '%s\n' "${CUSTOM_CRON:-}" ;;
+  esac
+}
+
+sync_cron() {
+  local cron_file expr
+  cron_file="/boot/config/plugins/${plugin}/unbackup.cron"
+  expr="$(cron_expr | xargs)"
+  if [[ -z "${expr}" ]]; then
+    rm -f "${cron_file}"
+  elif [[ "${expr}" =~ ^([^[:space:]]+[[:space:]]+){4}[^[:space:]]+$ ]]; then
+    printf '# UnBackup\n%s bash %q >/dev/null 2>&1\n' "${expr}" "/usr/local/emhttp/plugins/${plugin}/scripts/backup" > "${cron_file}"
+    chmod 0600 "${cron_file}"
+  fi
+  /usr/local/sbin/update_cron >/dev/null 2>&1 || true
+}
+
+init_paths() {
+  DESTINATION="${DESTINATION%/}"
+  APPDATA_ROOT="${APPDATA_ROOT%/}"
+  snapshot_base="$(dirname "${APPDATA_ROOT}")/.unbackup-snapshots"
+  archive="${DESTINATION}/unbackup-${hostname}-${timestamp}.tar.zst"
+  archive_partial="${archive}.partial"
+  work_dir="${DESTINATION}/in-progress/${timestamp}"
+  mkdir -p "${state_dir}"
+  chmod 0700 "${state_dir}"
+}
+
+write_status() {
+  local exit_code="$1" message="$2" now
+  now="$(date +%s)"
+  {
+    printf 'LAST_RUN_EPOCH=%s\n' "${now}"
+    printf 'LAST_EXIT_CODE=%s\n' "${exit_code}"
+    printf 'LAST_MESSAGE=%q\n' "${message}"
+    if (( exit_code == 0 )) && [[ -f "${archive}" ]]; then
+      printf 'LAST_ARCHIVE=%q\n' "${archive}"
+      printf 'LAST_ARCHIVE_BYTES=%s\n' "$(stat -c '%s' "${archive}")"
+      printf 'LAST_SUCCESS_EPOCH=%s\n' "${now}"
+    elif [[ -f "${status_file}" ]]; then
+      grep -E '^(LAST_ARCHIVE|LAST_ARCHIVE_BYTES|LAST_SUCCESS_EPOCH)=' "${status_file}" || true
+    fi
+  } > "${status_file}.tmp"
+  mv "${status_file}.tmp" "${status_file}"
+  chmod 0600 "${status_file}"
+}
+
+cleanup() {
+  cleanup_docker_snapshot
+  if [[ -n "${snapshot_path}" && -d "${snapshot_path}" ]]; then
+    btrfs subvolume delete "${snapshot_path}" >/dev/null 2>&1 || true
+  fi
+  [[ -n "${archive_partial}" ]] && rm -f "${archive_partial}"
+  [[ -n "${work_dir}" ]] && rm -rf "${work_dir}"
+  return 0
+}
+
+on_error() {
+  [[ -n "${failure_line}" ]] || failure_line="$1"
+}
+
+on_exit() {
+  local exit_code=$?
+  trap - ERR EXIT
+  if (( exit_code != 0 )) && [[ "${record_status}" == "yes" ]]; then
+    write_status "${exit_code}" "backup failed${failure_line:+ at line ${failure_line}}" || true
+  fi
+  cleanup
+  exit "${exit_code}"
+}
+trap 'on_error ${LINENO}' ERR
+trap on_exit EXIT
+
+load_excludes() {
+  local pattern
+  [[ -f "${EXCLUDE_FILE}" ]] || return 0
+  while IFS= read -r pattern || [[ -n "${pattern}" ]]; do
+    case "${pattern}" in
+      ""|\#*) continue ;;
+    esac
+    tar_excludes+=("--exclude=${pattern}")
+  done < "${EXCLUDE_FILE}"
+}
+
+template_appdata_paths() {
+  APPDATA_ROOT="${APPDATA_ROOT}" TEMPLATE_DIR="${template_dir}" php <<'PHP'
+<?php
+$root = rtrim(getenv('APPDATA_ROOT'), '/');
+$templateDir = rtrim(getenv('TEMPLATE_DIR'), '/');
+$paths = [];
+foreach (glob($templateDir . '/my-*.xml') ?: [] as $file) {
+  $base = basename($file);
+  if (substr($base, 0, 2) === '._' || strpos($base, '.bak') !== false) continue;
+  $xml = @simplexml_load_file($file);
+  if (!$xml) continue;
+  foreach ($xml->xpath('//Config') ?: [] as $config) {
+    $value = rtrim(trim((string)$config), '/');
+    if ($value === '') continue;
+    if (substr($value, 0, strlen('/mnt/user/appdata/')) === '/mnt/user/appdata/') {
+      $suffix = substr($value, strlen('/mnt/user/appdata/'));
+    } elseif (substr($value, 0, strlen($root . '/')) === $root . '/') {
+      $suffix = substr($value, strlen($root) + 1);
+    } else {
+      continue;
+    }
+    $top = explode('/', $suffix, 2)[0] ?? '';
+    if ($top !== '' && strpos($top, '..') === false) $paths[$root . '/' . $top] = true;
+  }
+}
+
+ksort($paths);
+foreach (array_keys($paths) as $path) echo $path . PHP_EOL;
+PHP
+}
+
+validate_config() {
+  local enabled_sources=0
+  [[ -n "${DESTINATION}" ]] || {
+    echo "Missing backup destination." >&2
+    return 1
+  }
+  [[ "${KEEP_LAST}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "Retention count must be a positive integer." >&2
+    return 1
+  }
+  [[ "${ZSTD_LEVEL}" =~ ^([1-9]|1[0-9])$ ]] || {
+    echo "zstd level must be between 1 and 19." >&2
+    return 1
+  }
+  if [[ "${INCLUDE_APPDATA}" == "yes" ]]; then
+    enabled_sources=$((enabled_sources + 1))
+    [[ -d "${APPDATA_ROOT}" ]] || {
+      echo "Missing appdata root: ${APPDATA_ROOT}" >&2
+      return 1
+    }
+    ((${#appdata_paths[@]})) || {
+      echo "No appdata paths selected from ${APPDATA_ROOT}." >&2
+      return 1
+    }
+  fi
+  if [[ "${INCLUDE_BOOT}" == "yes" ]]; then
+    enabled_sources=$((enabled_sources + 1))
+    [[ -e "${BOOT_SOURCE}" ]] || {
+      echo "Missing boot source: ${BOOT_SOURCE}" >&2
+      return 1
+    }
+  fi
+  if [[ "${INCLUDE_DOCKER_SOURCE}" == "yes" ]]; then
+    enabled_sources=$((enabled_sources + 1))
+    [[ "${DOCKER_SOURCE}" == /* && ( -f "${DOCKER_SOURCE}" || -d "${DOCKER_SOURCE}" ) ]] || {
+      echo "Docker storage source must be an existing absolute file or directory." >&2
+      return 1
+    }
+    case "${DOCKER_SOURCE%/}" in
+      /|/mnt|/mnt/user|/mnt/cache) echo "Docker storage source is too broad: ${DOCKER_SOURCE}" >&2; return 1 ;;
+    esac
+  fi
+  (( enabled_sources > 0 )) || {
+    echo "No backup sources are enabled." >&2
+    return 1
+  }
+}
+
+collect_appdata_paths() {
+  appdata_paths=()
+  [[ "${INCLUDE_APPDATA}" == "yes" ]] || return 0
+  if [[ "${APPDATA_MODE}" == "all" ]]; then
+    appdata_paths+=("${APPDATA_ROOT}")
+    return 0
+  fi
+  while IFS= read -r path; do
+    if [[ -d "${path}" ]]; then
+      appdata_paths+=("${path}")
+    fi
+  done < <(template_appdata_paths)
+}
+
+create_snapshot() {
+  local mountpoint snapshot_name fstype
+  [[ "${INCLUDE_APPDATA}" == "yes" ]] || return 0
+  ((${#appdata_paths[@]})) || return 0
+  [[ -d "${APPDATA_ROOT}" ]] || {
+    echo "Missing appdata root: ${APPDATA_ROOT}" >&2
+    exit 1
+  }
+  fstype="$(findmnt -n -o FSTYPE -T "${APPDATA_ROOT}")"
+  [[ "${fstype}" == "btrfs" ]] || {
+    echo "Appdata root ${APPDATA_ROOT} is ${fstype}, not btrfs; no snapshot backend configured." >&2
+    exit 1
+  }
+  mountpoint="$(findmnt -n -o TARGET -T "${APPDATA_ROOT}")"
+  snapshot_mountpoint="${mountpoint}"
+  mkdir -p "${snapshot_base}"
+  if ! btrfs subvolume show "${snapshot_base}" >/dev/null 2>&1; then
+    rmdir "${snapshot_base}" 2>/dev/null || true
+    btrfs subvolume create "${snapshot_base}" >/dev/null
+  fi
+  snapshot_name="${hostname}-${timestamp}"
+  snapshot_path="${snapshot_base}/${snapshot_name}"
+  echo "Creating read-only Btrfs snapshot ${snapshot_path}"
+  btrfs subvolume snapshot -r "${mountpoint}" "${snapshot_path}" >/dev/null
+}
+
+snapshot_rel() {
+  local path="$1" mountpoint rel
+  mountpoint="$(findmnt -n -o TARGET -T "${APPDATA_ROOT}")"
+  rel="${path#${mountpoint}/}"
+  [[ "${rel}" != "${path}" && -n "${rel}" ]] || return 1
+  printf '%s\n' "${rel}"
+}
+
+resolve_docker_source() {
+  local location relative candidate
+  if [[ "${DOCKER_SOURCE}" == /mnt/user/* ]]; then
+    candidate="$(realpath -e -- "${DOCKER_SOURCE}")"
+    if [[ "${candidate}" != /mnt/user/* ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+    location="$(getfattr -n system.LOCATION --only-values "${DOCKER_SOURCE}" 2>/dev/null | head -n 1)"
+    [[ "${location}" =~ ^[A-Za-z0-9._-]+$ ]] || {
+      echo "Docker storage must resolve to one Unraid disk or pool: ${DOCKER_SOURCE}" >&2
+      return 1
+    }
+    relative="${DOCKER_SOURCE#/mnt/user/}"
+    candidate="/mnt/${location}/${relative}"
+    [[ -f "${candidate}" || -d "${candidate}" ]] || {
+      echo "Resolved Docker storage source does not exist: ${candidate}" >&2
+      return 1
+    }
+    printf '%s\n' "${candidate}"
+  else
+    printf '%s\n' "${DOCKER_SOURCE}"
+  fi
+}
+
+escape_transform_pattern() {
+  sed 's/[][\\.^$*]/\\&/g' <<<"$1"
+}
+
+escape_transform_replacement() {
+  sed 's/[\\&#]/\\&/g' <<<"$1"
+}
+
+capture_docker_source() {
+  local source logical fstype mountpoint dataset escaped_source escaped_archive capture_target
+  [[ "${INCLUDE_DOCKER_SOURCE}" == "yes" ]] || return 0
+  source="$(resolve_docker_source)"
+  logical="${DOCKER_SOURCE#/}"
+  docker_archive_path="${logical}"
+  fstype="$(findmnt -n -o FSTYPE -T "${source}")"
+  mountpoint="$(findmnt -n -o TARGET -T "${source}")"
+  docker_source_rel="${source#${mountpoint}/}"
+  [[ "${docker_source_rel}" != "${source}" && -n "${docker_source_rel}" ]] || {
+    echo "Docker storage source must be below its filesystem mountpoint: ${source}" >&2
+    return 1
+  }
+
+  if [[ -f "${source}" && "${fstype}" != "zfs" ]]; then
+    docker_capture_parent="$(dirname "${source}")/.unbackup-docker-captures"
+    docker_capture_root="${docker_capture_parent}/${hostname}-${timestamp}"
+    mkdir -p "${docker_capture_root}"
+    docker_snapshot_type="reflink"
+    capture_target="${docker_capture_root}/$(basename "${source}")"
+    : > "${capture_target}"
+    if command -v lsattr >/dev/null 2>&1 && command -v chattr >/dev/null 2>&1 && [[ "$(lsattr -d -- "${source}" 2>/dev/null | awk '{print $1}')" == *C* ]]; then
+      chattr +C -- "${capture_target}"
+    fi
+    echo "Creating live reflink of Docker image storage"
+    cp -a --reflink=always --sparse=auto "${source}" "${capture_target}" || {
+      echo "Live Docker image backup requires Btrfs, ZFS, or file reflink support; found ${fstype}." >&2
+      return 1
+    }
+    docker_snapshot_path="${docker_capture_root}"
+    docker_source_rel="$(basename "${source}")"
+    docker_capture_method="reflink"
+  else case "${fstype}" in
+    btrfs)
+      if [[ -n "${snapshot_path}" && "${snapshot_mountpoint}" == "${mountpoint}" ]]; then
+        docker_snapshot_path="${snapshot_path}"
+        docker_snapshot_type="btrfs-reused"
+      else
+        docker_snapshot_base="${mountpoint}/.unbackup-docker-snapshots"
+        mkdir -p "${docker_snapshot_base}"
+        if ! btrfs subvolume show "${docker_snapshot_base}" >/dev/null 2>&1; then
+          rmdir "${docker_snapshot_base}" 2>/dev/null || true
+          btrfs subvolume create "${docker_snapshot_base}" >/dev/null
+        fi
+        docker_snapshot_path="${docker_snapshot_base}/${hostname}-${timestamp}"
+        echo "Creating live Btrfs snapshot for Docker storage"
+        btrfs subvolume snapshot -r "${mountpoint}" "${docker_snapshot_path}" >/dev/null
+        docker_snapshot_type="btrfs"
+      fi
+      docker_capture_method="btrfs-snapshot"
+      ;;
+    zfs)
+      dataset="$(findmnt -n -o SOURCE -T "${source}")"
+      docker_snapshot_name="${dataset}@unbackup-${hostname}-${timestamp}"
+      echo "Creating live ZFS snapshot for Docker storage"
+      zfs snapshot "${docker_snapshot_name}"
+      docker_snapshot_path="${mountpoint}/.zfs/snapshot/unbackup-${hostname}-${timestamp}"
+      docker_snapshot_type="zfs"
+      docker_capture_method="zfs-snapshot"
+      ;;
+    *) echo "Live Docker directory backup requires Btrfs or ZFS; found ${fstype}." >&2; return 1 ;;
+  esac; fi
+
+  escaped_source="$(escape_transform_pattern "${docker_source_rel}")"
+  escaped_archive="$(escape_transform_replacement "${docker_archive_path}")"
+  docker_transform="s#^${escaped_source}\(/\|$\)#${escaped_archive}\1#"
+}
+
+cleanup_docker_snapshot() {
+  case "${docker_snapshot_type}" in
+    btrfs)
+      [[ -n "${docker_snapshot_path}" && -d "${docker_snapshot_path}" ]] && btrfs subvolume delete "${docker_snapshot_path}" >/dev/null 2>&1 || true
+      [[ -n "${docker_snapshot_base}" ]] && rmdir "${docker_snapshot_base}" 2>/dev/null || true
+      ;;
+    zfs)
+      [[ -n "${docker_snapshot_name}" ]] && zfs destroy "${docker_snapshot_name}" >/dev/null 2>&1 || true
+      ;;
+    reflink)
+      if [[ -n "${docker_capture_root}" && "${docker_capture_root}" == */.unbackup-docker-captures/* ]]; then
+        rm -rf "${docker_capture_root}"
+        [[ -n "${docker_capture_parent}" ]] && rmdir "${docker_capture_parent}" 2>/dev/null || true
+      fi
+      ;;
+  esac
+  docker_snapshot_type=""
+  docker_snapshot_path=""
+  docker_snapshot_name=""
+  docker_capture_root=""
+}
+
+apply_retention() {
+  local existing count remove_count
+  mapfile -t existing < <(find "${DESTINATION}" -maxdepth 1 -type f -name "unbackup-${hostname}-*.tar.zst" -printf '%T@ %p\n' | sort -n | awk '{print $2}')
+  count="${#existing[@]}"
+  remove_count=$((count - KEEP_LAST))
+  if (( remove_count > 0 )); then
+    printf '%s\n' "${existing[@]:0:remove_count}" | xargs -r rm -f
+  fi
+}
+
+print_plan() {
+  echo "Destination: ${DESTINATION}"
+  echo "Archive: ${archive}"
+  echo "Retention: keep last ${KEEP_LAST}"
+  echo
+  echo "Appdata mode: ${INCLUDE_APPDATA}/${APPDATA_MODE}"
+  if ((${#appdata_paths[@]})); then
+    du -sh "${appdata_paths[@]}" 2>/dev/null || true
+  else
+    echo "(no appdata paths selected)"
+  fi
+  echo
+  echo "Boot source: ${INCLUDE_BOOT} ${BOOT_SOURCE}"
+  [[ "${INCLUDE_BOOT}" == "yes" && -e "${BOOT_SOURCE}" ]] && du -sh "${BOOT_SOURCE}" 2>/dev/null || true
+  echo
+  echo "Docker storage source: ${INCLUDE_DOCKER_SOURCE} ${DOCKER_SOURCE}"
+  [[ "${INCLUDE_DOCKER_SOURCE}" == "yes" && -n "${DOCKER_SOURCE}" && -e "${DOCKER_SOURCE}" ]] && du -sh "${DOCKER_SOURCE}" 2>/dev/null || true
+  echo
+  echo "Tar excludes:"
+  ((${#tar_excludes[@]})) && printf '%s\n' "${tar_excludes[@]}" || echo "(none)"
+}
+
+main() {
+  local mode="${1:-run}" rel
+  case "${mode}" in
+    run|--plan|--check|--validate|--sync-cron) ;;
+    *) echo "Usage: $0 [--plan|--check|--validate|--sync-cron]" >&2; return 2 ;;
+  esac
+  [[ "${mode}" == "run" ]] && record_status="yes"
+  load_config
+  if [[ "${mode}" == "--sync-cron" ]]; then
+    sync_cron
+    return 0
+  fi
+  init_paths
+  collect_appdata_paths
+  load_excludes
+  validate_config
+
+  if [[ "${mode}" == "--validate" ]]; then
+    echo "Configuration OK"
+    return 0
+  fi
+
+  if [[ "${mode}" == "--plan" ]]; then
+    print_plan
+    return 0
+  fi
+
+  exec 9>"${lock_file}"
+  flock -n 9 || {
+    echo "Another UnBackup is already running." >&2
+    exit 1
+  }
+
+  if [[ "${mode}" == "run" ]]; then
+    : > "${log_file}"
+    chmod 0600 "${log_file}"
+    exec > >(tee -a "${log_file}") 2>&1
+  fi
+
+  echo "Starting UnBackup ${timestamp}"
+
+  if [[ "${mode}" != "--check" ]]; then
+    mkdir -p "${DESTINATION}/in-progress"
+    chmod 0700 "${DESTINATION}" "${DESTINATION}/in-progress"
+  fi
+
+  rm -rf "${work_dir}"
+  if [[ "${mode}" != "--check" ]]; then
+    mkdir -p "${work_dir}"
+    chmod 0700 "${work_dir}"
+  fi
+  create_snapshot
+  capture_docker_source
+
+  if [[ "${mode}" == "--check" ]]; then
+    echo "Live snapshot and Docker storage capture check OK"
+    return 0
+  fi
+
+  {
+    printf 'timestamp_utc=%s\n' "${timestamp}"
+    printf 'host=%s\n' "${hostname}"
+    printf 'appdata_root=%s\n' "${APPDATA_ROOT}"
+    printf 'appdata_mode=%s\n' "${APPDATA_MODE}"
+    printf 'boot_source=%s\n' "${BOOT_SOURCE}"
+    printf 'docker_source=%s\n' "${DOCKER_SOURCE}"
+    printf 'docker_capture_method=%s\n' "${docker_capture_method}"
+    printf 'zstd_level=%s\n' "${ZSTD_LEVEL}"
+    printf '\n[appdata_paths]\n'
+    printf '%s\n' "${appdata_paths[@]}"
+  } > "${work_dir}/manifest.txt"
+
+  echo "Creating archive ${archive}"
+  rm -f "${archive_partial}"
+  tar_args=(--xattrs --acls --numeric-owner "${tar_excludes[@]}" -cf -)
+  if [[ -n "${snapshot_path}" ]]; then
+    for path in "${appdata_paths[@]}"; do
+      rel="$(snapshot_rel "${path}")"
+      tar_args+=(-C "${snapshot_path}" "${rel}")
+    done
+  fi
+  [[ "${INCLUDE_BOOT}" == "yes" ]] && tar_args+=(-C "/" "${BOOT_SOURCE#/}")
+  [[ "${INCLUDE_DOCKER_SOURCE}" == "yes" ]] && tar_args+=(--transform="${docker_transform}" -C "${docker_snapshot_path}" "${docker_source_rel}")
+  tar_args+=(-C "${work_dir}" manifest.txt)
+
+  tar "${tar_args[@]}" | zstd "-${ZSTD_LEVEL}" -T0 -o "${archive_partial}"
+  cleanup_docker_snapshot
+  echo "Verifying archive"
+  zstd -dc "${archive_partial}" | tar -tf - >/dev/null
+  chmod 0600 "${archive_partial}"
+  mv "${archive_partial}" "${archive}"
+  if ! ln -sfn "${archive}" "${DESTINATION}/latest.tar.zst"; then
+    echo "Warning: destination does not support the latest.tar.zst symlink; continuing." >&2
+  fi
+
+  echo "Applying retention: keep last ${KEEP_LAST}"
+  apply_retention
+  write_status 0 "backup completed"
+  echo "Backup complete: ${archive}"
+}
+
+main "$@"

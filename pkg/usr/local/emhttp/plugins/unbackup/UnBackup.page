@@ -1,0 +1,220 @@
+Menu="Utilities"
+Title="UnBackup"
+Icon="archive"
+---
+<?
+$plugin = 'unbackup';
+$dir = "/boot/config/plugins/$plugin";
+$state = "$dir/state";
+$configFile = "$dir/settings.json";
+$cronFile = "$dir/unbackup.cron";
+$script = "/usr/local/emhttp/plugins/$plugin/scripts/backup";
+
+$defaults = [
+  'APPDATA_ROOT' => '/mnt/cache/appdata',
+  'APPDATA_MODE' => 'templates',
+  'DESTINATION' => '/mnt/user/backup/unbackup',
+  'INCLUDE_APPDATA' => 'yes',
+  'INCLUDE_BOOT' => 'yes',
+  'BOOT_SOURCE' => '/boot/config',
+  'INCLUDE_DOCKER_SOURCE' => 'no',
+  'DOCKER_SOURCE' => '',
+  'KEEP_LAST' => '4',
+  'ZSTD_LEVEL' => '6',
+  'EXCLUDE_FILE' => "$dir/excludes.txt",
+  'BACKUP_FREQUENCY' => 'weekly',
+  'DAY_OF_WEEK' => '1',
+  'DAY_OF_MONTH' => '1',
+  'HOUR' => '0',
+  'MINUTE' => '0',
+  'CUSTOM_CRON' => '',
+];
+
+@mkdir($dir, 0700, true);
+@mkdir($state, 0700, true);
+
+function h($value) {
+  return htmlspecialchars((string)$value, ENT_QUOTES);
+}
+
+function setting_label($label) {
+  return '<span class="unbackup-help-label">' . h($label) . '</span>';
+}
+
+function setting_help($help) {
+  return '<tr class="unbackup-help-row" style="display:none"><td colspan="2"><blockquote class="inline_help">' . h($help) . '</blockquote></td></tr>';
+}
+
+function load_settings($file, $defaults) {
+  $cfg = json_decode(@file_get_contents($file), true);
+  return array_merge($defaults, is_array($cfg) ? $cfg : []);
+}
+
+function normalize_settings($settings, $dir, &$changed = false) {
+  if (($settings['DESTINATION'] ?? '') === '/mnt/user/backup/docker-boot') {
+    $settings['DESTINATION'] = '/mnt/user/backup/unbackup';
+    $changed = true;
+  }
+  if (($settings['EXCLUDE_FILE'] ?? '') === '/boot/config/plugins/docker.boot.backup/excludes.txt') {
+    $settings['EXCLUDE_FILE'] = "$dir/excludes.txt";
+    $changed = true;
+  }
+  return $settings;
+}
+
+function cron_expr($settings) {
+  $frequency = $settings['BACKUP_FREQUENCY'] ?? 'disabled';
+  $minute = max(0, min(59, (int)($settings['MINUTE'] ?? 0)));
+  $hour = max(0, min(23, (int)($settings['HOUR'] ?? 0)));
+  $dow = max(0, min(6, (int)($settings['DAY_OF_WEEK'] ?? 1)));
+  $dom = max(1, min(31, (int)($settings['DAY_OF_MONTH'] ?? 1)));
+  if ($frequency === 'daily') return "$minute $hour * * *";
+  if ($frequency === 'weekly') return "$minute $hour * * $dow";
+  if ($frequency === 'monthly') return "$minute $hour $dom * *";
+  if ($frequency === 'custom') return trim($settings['CUSTOM_CRON'] ?? '');
+  return '';
+}
+
+function write_cron($settings, $cronFile, $script) {
+  $expr = cron_expr($settings);
+  if ($expr === '') {
+    @unlink($cronFile);
+    exec('/usr/local/sbin/update_cron >/dev/null 2>&1');
+    return;
+  }
+  if (!preg_match('/^([^\s]+\s+){4}[^\s]+$/', trim($expr))) return;
+  file_put_contents($cronFile, "# UnBackup\n$expr bash " . escapeshellarg($script) . " >/dev/null 2>&1\n");
+  @chmod($cronFile, 0600);
+  exec('/usr/local/sbin/update_cron >/dev/null 2>&1');
+}
+
+$settingsChanged = false;
+$settings = normalize_settings(load_settings($configFile, $defaults), $dir, $settingsChanged);
+if ($settingsChanged) {
+  file_put_contents($configFile, json_encode($settings, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . PHP_EOL);
+}
+$message = '';
+$output = '';
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+  $action = $_POST['backup_action'] ?? '';
+  foreach ($defaults as $key => $default) {
+    if (substr($key, 0, 8) === 'INCLUDE_') {
+      $settings[$key] = isset($_POST[$key]) ? 'yes' : 'no';
+    } else {
+      $settings[$key] = trim($_POST[$key] ?? $settings[$key] ?? $default);
+    }
+  }
+  file_put_contents($configFile, json_encode($settings, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+  write_cron($settings, $cronFile, $script);
+  $message = 'Settings saved.';
+
+  if ($action === 'preview') {
+    $output = shell_exec('bash ' . escapeshellarg($script) . ' --plan 2>&1');
+  } elseif ($action === 'check') {
+    $output = shell_exec('bash ' . escapeshellarg($script) . ' --check 2>&1');
+  } elseif ($action === 'run') {
+    exec('nohup bash ' . escapeshellarg($script) . ' >/dev/null 2>&1 &');
+    $message = 'Backup started in background.';
+  }
+}
+
+$status = @file_get_contents("$state/status.env") ?: '';
+$log = @file_exists("$state/last.log") ? implode('', array_slice(file("$state/last.log"), -80)) : '';
+?>
+<form method="post">
+  <?if ($message):?><p><b><?=h($message)?></b></p><?endif;?>
+
+  <table class="settings">
+    <tr><td><?=setting_label('Appdata backup')?></td><td><input type="checkbox" name="INCLUDE_APPDATA" <?=($settings['INCLUDE_APPDATA']==='yes'?'checked':'')?>></td></tr>
+    <?=setting_help('Include Docker application data in the archive.')?>
+    <tr><td><?=setting_label('Appdata root')?></td><td><input type="text" name="APPDATA_ROOT" value="<?=h($settings['APPDATA_ROOT'])?>" class="narrow"></td></tr>
+    <?=setting_help('Root folder containing container appdata directories.')?>
+    <tr><td><?=setting_label('Appdata mode')?></td><td>
+      <select name="APPDATA_MODE">
+        <option value="templates" <?=($settings['APPDATA_MODE']==='templates'?'selected':'')?>>Template folders only</option>
+        <option value="all" <?=($settings['APPDATA_MODE']==='all'?'selected':'')?>>Whole appdata root</option>
+      </select>
+    </td></tr>
+    <?=setting_help('Template folders only backs up appdata folders referenced by current Docker templates. Whole appdata root backs up the full root path.')?>
+    <tr><td><?=setting_label('Boot/config backup')?></td><td><input type="checkbox" name="INCLUDE_BOOT" <?=($settings['INCLUDE_BOOT']==='yes'?'checked':'')?>></td></tr>
+    <?=setting_help('Include the Unraid flash configuration folder.')?>
+    <tr><td><?=setting_label('Boot source')?></td><td><input type="text" name="BOOT_SOURCE" value="<?=h($settings['BOOT_SOURCE'])?>" class="narrow"></td></tr>
+    <?=setting_help('Path to the flash configuration folder to archive.')?>
+    <tr><td><?=setting_label('Docker storage backup')?></td><td><input type="checkbox" name="INCLUDE_DOCKER_SOURCE" <?=($settings['INCLUDE_DOCKER_SOURCE']==='yes'?'checked':'')?>></td></tr>
+    <?=setting_help('Back up either a Docker image file or Docker directory while Docker keeps running. Image files use an atomic reflink or ZFS snapshot; directories require a Btrfs or ZFS snapshot.')?>
+    <tr><td><?=setting_label('Docker storage source')?></td><td><input type="text" name="DOCKER_SOURCE" value="<?=h($settings['DOCKER_SOURCE'])?>" class="narrow" placeholder="/mnt/user/system/docker/docker.img"></td></tr>
+    <?=setting_help('Absolute path to the configured Docker image file or Docker directory.')?>
+    <tr><td><?=setting_label('Destination')?></td><td><input type="text" name="DESTINATION" value="<?=h($settings['DESTINATION'])?>" class="narrow"></td></tr>
+    <?=setting_help('Folder where backup archives are written.')?>
+    <tr><td><?=setting_label('Retention count')?></td><td><input type="number" min="1" name="KEEP_LAST" value="<?=h($settings['KEEP_LAST'])?>"></td></tr>
+    <?=setting_help('Number of newest archives to keep for this host.')?>
+    <tr><td><?=setting_label('zstd level')?></td><td><input type="number" min="1" max="19" name="ZSTD_LEVEL" value="<?=h($settings['ZSTD_LEVEL'])?>"></td></tr>
+    <?=setting_help('Compression level from 1 to 19. Higher values can be smaller but slower.')?>
+    <tr><td><?=setting_label('Exclude file')?></td><td><input type="text" name="EXCLUDE_FILE" value="<?=h($settings['EXCLUDE_FILE'])?>" class="narrow"></td></tr>
+    <?=setting_help('Optional file containing tar exclude patterns, one per line.')?>
+    <tr><td><?=setting_label('Scheduled backup frequency')?></td><td>
+      <select name="BACKUP_FREQUENCY">
+        <?foreach (['disabled','daily','weekly','monthly','custom'] as $value):?>
+          <option value="<?=$value?>" <?=($settings['BACKUP_FREQUENCY']===$value?'selected':'')?>><?=$value?></option>
+        <?endforeach;?>
+      </select>
+    </td></tr>
+    <?=setting_help('Controls whether cron runs the backup daily, weekly, monthly, or from a custom cron entry.')?>
+    <tr><td><?=setting_label('Day of Week')?></td><td>
+      <select name="DAY_OF_WEEK">
+        <?foreach ([1=>'Monday',2=>'Tuesday',3=>'Wednesday',4=>'Thursday',5=>'Friday',6=>'Saturday',0=>'Sunday'] as $value => $label):?>
+          <option value="<?=$value?>" <?=((string)$settings['DAY_OF_WEEK']===(string)$value?'selected':'')?>><?=$label?></option>
+        <?endforeach;?>
+      </select>
+    </td></tr>
+    <?=setting_help('Used for weekly schedules.')?>
+    <tr><td><?=setting_label('Day of Month')?></td><td>
+      <select name="DAY_OF_MONTH">
+        <?for ($i = 1; $i <= 31; $i++):?>
+          <?$suffix = ($i % 10 == 1 && $i != 11) ? 'st' : (($i % 10 == 2 && $i != 12) ? 'nd' : (($i % 10 == 3 && $i != 13) ? 'rd' : 'th'));?>
+          <option value="<?=$i?>" <?=((string)$settings['DAY_OF_MONTH']===(string)$i?'selected':'')?>><?=$i.$suffix?></option>
+        <?endfor;?>
+      </select>
+    </td></tr>
+    <?=setting_help('Used for monthly schedules.')?>
+    <tr><td><?=setting_label('Hour')?></td><td><input type="number" min="0" max="23" name="HOUR" value="<?=h($settings['HOUR'])?>"></td></tr>
+    <?=setting_help('Backup start hour in 24-hour time.')?>
+    <tr><td><?=setting_label('Minute')?></td><td><input type="number" min="0" max="59" name="MINUTE" value="<?=h($settings['MINUTE'])?>"></td></tr>
+    <?=setting_help('Backup start minute.')?>
+    <tr><td><?=setting_label('Custom Cron Entry')?></td><td><input type="text" name="CUSTOM_CRON" value="<?=h($settings['CUSTOM_CRON'])?>" placeholder="0 0 * * 1" class="narrow"></td></tr>
+    <?=setting_help('Five-field cron expression used only when frequency is custom.')?>
+  </table>
+
+  <p>
+    <button type="submit" name="backup_action" value="save">Save</button>
+    <button type="submit" name="backup_action" value="preview">Preview</button>
+    <button type="submit" name="backup_action" value="check">Check Live Snapshot/Capture</button>
+    <button type="submit" name="backup_action" value="run">Run Backup</button>
+  </p>
+</form>
+
+<?if ($output):?>
+  <h3>Output</h3>
+  <pre><?=h($output)?></pre>
+<?endif;?>
+
+<h3>Status</h3>
+<pre><?=h($status ?: 'No status yet.')?></pre>
+
+<h3>Log</h3>
+<pre><?=h($log ?: 'No log yet.')?></pre>
+
+<style>
+.unbackup-help-label { cursor: pointer; user-select: none; }
+.unbackup-help-label:hover { color: var(--link-hover-color, #2e6da4); }
+.unbackup-help-row td { padding: 0; }
+.unbackup-help-row blockquote.inline_help { box-sizing: border-box; display: block; margin: 8px 0; max-width: 100%; width: 802px; }
+</style>
+<script>
+$(function() {
+  $('.unbackup-help-label').on('click', function() {
+    $(this).closest('tr').next('.unbackup-help-row').toggle('slow');
+  });
+});
+</script>

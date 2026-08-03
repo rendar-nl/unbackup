@@ -1,0 +1,82 @@
+<?xml version='1.0' standalone='yes'?>
+<!DOCTYPE PLUGIN [
+  <!ENTITY name      "unbackup">
+  <!ENTITY author    "UnBackup">
+  <!ENTITY version   "2026.08.03.1">
+  <!ENTITY package   "unbackup-&version;-x86_64-1.txz">
+  <!ENTITY plugdir   "/usr/local/emhttp/plugins/&name;">
+  <!ENTITY bootdir   "/boot/config/plugins/&name;">
+  <!ENTITY source    "&bootdir;/&package;">
+  <!ENTITY pluginURL "https://raw.githubusercontent.com/rendar-nl/unbackup/main/unbackup.plg">
+  <!ENTITY packageURL "https://github.com/rendar-nl/unbackup/releases/download/&version;/&package;">
+  <!ENTITY packageSHA256 "11888e3a76d0d332f6b235a0ec779fdd5d524f8da7d7a6a17be3cd0bde7f5487">
+  <!ENTITY launch    "Utilities/UnBackup">
+]>
+
+<PLUGIN name="&name;" author="&author;" version="&version;" pluginURL="&pluginURL;" launch="&launch;" icon="archive">
+  <CHANGES>
+    <![CDATA[
+### 2026.08.03.1
+- Move the canonical source to github.com/rendar-nl/unbackup.
+- Download versioned packages from GitHub Releases with SHA-256 verification.
+
+### 2026.08.02
+- Fail closed when appdata or boot sources are missing, template mode selects no appdata, or no sources are enabled.
+- Reject regular-file Docker sources such as a live docker.img; optional extra sources must be directories.
+- Write and verify a private partial archive before publishing the final name and latest symlink.
+- Record failed scheduled runs reliably from the process exit path and preserve the previous successful archive metadata.
+- Treat an unsupported latest symlink as a warning; the verified archive and status metadata remain authoritative.
+- Return the correct success status after cron synchronization and other no-work cleanup paths.
+- Support both Docker image-file and directory storage through a brief Docker quiesce, stable local reflink/copy capture, immediate restart, and offline archive compression.
+- Replace Docker quiescing with online Btrfs/ZFS snapshots or an atomic image-file reflink so Docker remains running throughout the backup.
+- Use the reflink-compatible sparse mode required by Unraid's coreutils.
+- Clean an empty image-capture directory when reflink creation fails.
+- Resolve Unraid user-share paths that directly map to a pool before falling back to the location attribute.
+- Match a Btrfs image file's NOCOW state on the reflink target for compatibility across Unraid pools.
+
+### 2026.06.14
+- First package: snapshot-based appdata backup, boot/config backup, optional Docker image/folder backup, preview, cron schedule, and count retention.
+- Renamed package, page, config paths, cron, archive prefix, and snapshot path to UnBackup.
+- Normalized migrated settings so old default paths are not persisted.
+- Fixed normalized settings handling under shell errexit.
+]]>
+  </CHANGES>
+
+  <FILE Name="&source;">
+    <URL>&packageURL;</URL>
+    <SHA256>&packageSHA256;</SHA256>
+  </FILE>
+
+  <FILE Run="/bin/bash">
+    <INLINE>
+      oldboot="/boot/config/plugins/docker.boot.backup"
+      oldplug="/usr/local/emhttp/plugins/docker.boot.backup"
+      mkdir -p &bootdir;
+      if [ -d "$oldboot" ]; then
+        [ -f "$oldboot/settings.json" ] &amp;&amp; [ ! -f "&bootdir;/settings.json" ] &amp;&amp; cp -p "$oldboot/settings.json" "&bootdir;/settings.json"
+        [ -f "$oldboot/excludes.txt" ] &amp;&amp; [ ! -f "&bootdir;/excludes.txt" ] &amp;&amp; cp -p "$oldboot/excludes.txt" "&bootdir;/excludes.txt"
+        [ -d "$oldboot/state" ] &amp;&amp; [ ! -d "&bootdir;/state" ] &amp;&amp; cp -a "$oldboot/state" "&bootdir;/state"
+        rm -f "$oldboot/docker_boot_backup.cron" "$oldboot/unbackup.cron"
+      fi
+      if [ -f "&bootdir;/settings.json" ]; then
+        php -r '$f=$argv[1]; $j=json_decode(file_get_contents($f), true); if (is_array($j)) { $changed=false; if (($j["DESTINATION"] ?? "") === "/mnt/user/backup/docker-boot") { $j["DESTINATION"] = "/mnt/user/backup/unbackup"; $changed=true; } if (($j["EXCLUDE_FILE"] ?? "") === "/boot/config/plugins/docker.boot.backup/excludes.txt") { $j["EXCLUDE_FILE"] = "/boot/config/plugins/unbackup/excludes.txt"; $changed=true; } if ($changed) file_put_contents($f, json_encode($j, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . PHP_EOL); }' "&bootdir;/settings.json"
+      fi
+      rm -rf "$oldplug"
+      rm -f /boot/config/plugins/docker.boot.backup.plg
+      rm -rf &plugdir;
+      installpkg "&source;"
+      chmod +x &plugdir;/scripts/backup
+      mkdir -p &bootdir;/state
+      bash &plugdir;/scripts/backup --sync-cron || true
+      /usr/local/sbin/update_cron >/dev/null 2&gt;&amp;1 || true
+    </INLINE>
+  </FILE>
+
+  <FILE Run="/bin/bash" Method="remove">
+    <INLINE>
+      rm -rf &plugdir;
+      rm -f &bootdir;/unbackup.cron
+      /usr/local/sbin/update_cron >/dev/null 2>&amp;1 || true
+    </INLINE>
+  </FILE>
+</PLUGIN>
