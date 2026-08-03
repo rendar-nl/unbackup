@@ -67,3 +67,7 @@ It accepts `--validate`, `--plan`, `--check`, and `--sync-cron`. Running it with
 ## Source
 
 The canonical repository is <https://github.com/rendar-nl/unbackup>.
+
+## License
+
+UnBackup is licensed under the [MIT License](LICENSE). Copyright (c) 2026 Rob Gökemeijer.
