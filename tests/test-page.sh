@@ -24,7 +24,9 @@ assert_contains 'class="narrow unbackup-path-picker"'
 assert_contains 'data-frequencies="weekly"'
 assert_contains 'data-frequencies="monthly"'
 assert_contains "jquery.filetree.js"
-assert_contains "\$('.unbackup-path-picker').fileTreeAttach();"
+assert_contains "\$('.unbackup-path-picker').each(function() {"
+assert_contains "input.fileTreeAttach();"
+assert_contains "input.next('.fileTree').offset({left: input.offset().left});"
 assert_contains 'updateScheduleFields();'
 assert_absent 'value="preview"'
 assert_absent 'value="check"'

@@ -215,7 +215,13 @@ $(function() {
   $('.unbackup-help-label').on('click', function() {
     $(this).closest('tr').next('.unbackup-help-row').toggle('slow');
   });
-  $('.unbackup-path-picker').fileTreeAttach();
+  $('.unbackup-path-picker').each(function() {
+    var input = $(this);
+    input.fileTreeAttach();
+    input.on('click', function() {
+      input.next('.fileTree').offset({left: input.offset().left});
+    });
+  });
   $('#unbackup-frequency').on('change', updateScheduleFields);
   updateScheduleFields();
 });
