@@ -2,20 +2,26 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name      "unbackup">
   <!ENTITY author    "UnBackup">
-  <!ENTITY version   "2026.08.03.2">
+  <!ENTITY version   "2026.08.09">
   <!ENTITY package   "unbackup-&version;-x86_64-1.txz">
   <!ENTITY plugdir   "/usr/local/emhttp/plugins/&name;">
   <!ENTITY bootdir   "/boot/config/plugins/&name;">
   <!ENTITY source    "&bootdir;/&package;">
   <!ENTITY pluginURL "https://raw.githubusercontent.com/rendar-nl/unbackup/main/unbackup.plg">
   <!ENTITY packageURL "https://github.com/rendar-nl/unbackup/releases/download/&version;/&package;">
-  <!ENTITY packageSHA256 "b7dec5499c05fb823812f0515afea48c592e06aabb12cee2145a4a5fb6de6aa2">
+  <!ENTITY packageSHA256 "0dd81a9e0840096262af8b78e9b2485b711af31ba8684193ed60cb712b938287">
   <!ENTITY launch    "Utilities/UnBackup">
 ]>
 
 <PLUGIN name="&name;" author="&author;" version="&version;" pluginURL="&pluginURL;" launch="&launch;" icon="archive">
   <CHANGES>
     <![CDATA[
+### 2026.08.09
+- Simplify the WebGUI to Save and Run Backup; keep validation, planning, and capture checks available from the command line.
+- Clarify the difference between Docker template folders and the entire appdata root.
+- Disable schedule fields that do not apply to the selected frequency.
+- Add Unraid's native file and directory pickers to path fields and align their popups with the selected input.
+
 ### 2026.08.03.2
 - License UnBackup under MIT, copyright Rob Gökemeijer.
 - Include the license text in the installable package.

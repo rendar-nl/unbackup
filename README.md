@@ -38,6 +38,16 @@ https://raw.githubusercontent.com/rendar-nl/unbackup/main/unbackup.plg
 
 The manifest downloads the versioned package from the corresponding GitHub release and verifies its SHA-256 checksum.
 
+## Updating
+
+Open the **Plugins** tab in the Unraid WebGUI, click **Check for Updates**, then click **Update** for UnBackup. Existing settings, schedules, status, and excludes under `/boot/config/plugins/unbackup/` are preserved.
+
+If UnBackup was installed manually and does not appear in the update list, reinstall the current manifest URL through **Plugins → Install Plugin**:
+
+```text
+https://raw.githubusercontent.com/rendar-nl/unbackup/main/unbackup.plg
+```
+
 ## Manual installation fallback
 
 To install without remote access, copy both files to the Unraid server:

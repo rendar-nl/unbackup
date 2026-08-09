@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version="2026.08.03.2"
+version="2026.08.09"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 release_timestamp="${version:0:4}${version:5:2}${version:8:2}0000"
 mkdir -p "${root}/dist"
