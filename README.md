@@ -22,6 +22,7 @@ Unsupported storage layouts fail closed instead of falling back to a live file c
 
 ```bash
 bash tests/test-backup.sh
+bash tests/test-page.sh
 bash build.sh
 ```
 
@@ -52,7 +53,7 @@ Then install it from an Unraid shell:
 plugin install /boot/config/plugins/unbackup.plg
 ```
 
-Open **Utilities → UnBackup**, save the server-specific paths, and run **Validate**, **Preview**, and **Check** before the first backup.
+Open **Utilities → UnBackup** and save the server-specific paths. Operator diagnostics remain available from the shell with `backup --validate`, `backup --plan`, and `backup --check`.
 
 ## Command line
 
