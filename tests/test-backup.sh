@@ -206,9 +206,11 @@ printf '%s\n' \
   '#!/usr/bin/env bash' \
   "events='${tmp}/capture-events'" \
   "directory='${docker_directory}'" \
+  "nested='${tmp}/nested-subvolumes'" \
   'case "$1 $2" in' \
   '  "subvolume show") exit 1 ;;' \
   '  "subvolume create") mkdir -p "$3" ;;' \
+  '  "subvolume list") if [[ -f "$nested" ]]; then cat "$nested"; fi ;;' \
   '  "subvolume snapshot")' \
   '    destination="${@: -1}"' \
   '    mkdir -p "$destination"' \
@@ -269,6 +271,34 @@ docker_image_alias="${tmp}/docker-image-alias"
 ln -s "$docker_image" "$docker_image_alias"
 assert_docker_capture resolved-image-file-capture "$docker_image_alias" reflink '\.unbackup-docker-captures'
 assert_docker_capture directory-docker-capture "$docker_directory" snapshot '\.unbackup-docker-snapshots'
+
+printf 'ID 257 gen 9 top level 5 path layers/abc\n' > "${tmp}/nested-subvolumes"
+write_settings "$empty_root" templates no yes "$docker_directory"
+: > "${tmp}/capture-events"
+: > "${tmp}/docker-events"
+rm -f "${tmp}/tar-args"
+if output="$(PATH="${tmp}/bin:${PATH}" bash "${script}" 2>&1)"; then
+  echo "FAIL nested-docker-subvolume: incomplete Docker capture was accepted" >&2
+  exit 1
+fi
+if [[ "$output" != *"nested Btrfs subvolumes"* ]]; then
+  printf 'FAIL nested-docker-subvolume: expected rejection message\n%s\n' "$output" >&2
+  exit 1
+fi
+if [[ -e "${tmp}/tar-args" ]]; then
+  echo "FAIL nested-docker-subvolume: archive was created from an incomplete snapshot" >&2
+  exit 1
+fi
+if ! grep -q '^LAST_EXIT_CODE=1$' "${tmp}/state/status.env"; then
+  echo "FAIL nested-docker-subvolume: failure status was not recorded" >&2
+  exit 1
+fi
+if find "${tmp}/.unbackup-docker-snapshots" -mindepth 1 -print 2>/dev/null | grep -q .; then
+  echo "FAIL nested-docker-subvolume: Docker snapshot was not cleaned up" >&2
+  exit 1
+fi
+rm -f "${tmp}/nested-subvolumes"
+printf 'PASS nested-docker-subvolume\n'
 
 write_settings "$empty_root" templates no yes "$docker_image"
 : > "${tmp}/capture-events"

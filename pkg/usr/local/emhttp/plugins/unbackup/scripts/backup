@@ -339,7 +339,7 @@ escape_transform_replacement() {
 }
 
 capture_docker_source() {
-  local source logical fstype mountpoint dataset escaped_source escaped_archive capture_target
+  local source logical fstype mountpoint dataset escaped_source escaped_archive capture_target nested_subvolumes
   [[ "${INCLUDE_DOCKER_SOURCE}" == "yes" ]] || return 0
   source="$(resolve_docker_source)"
   logical="${DOCKER_SOURCE#/}"
@@ -388,6 +388,16 @@ capture_docker_source() {
         docker_snapshot_type="btrfs"
       fi
       docker_capture_method="btrfs-snapshot"
+      # A Btrfs snapshot omits nested subvolumes (for example Docker layers) and
+      # leaves empty directories in their place, so refuse rather than archive them.
+      nested_subvolumes="$(btrfs subvolume list -o "${source}" 2>/dev/null)" || {
+        echo "Unable to list nested Btrfs subvolumes under ${source}." >&2
+        return 1
+      }
+      [[ -z "${nested_subvolumes}" ]] || {
+        echo "Docker storage contains nested Btrfs subvolumes that a snapshot would omit: ${source}" >&2
+        return 1
+      }
       ;;
     zfs)
       dataset="$(findmnt -n -o SOURCE -T "${source}")"
